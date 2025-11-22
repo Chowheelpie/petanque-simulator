@@ -1,873 +1,402 @@
-import React, { useState, useMemo, useCallback, useEffect, useRef } from 'react';
-import { Play, RotateCcw, Settings, BarChart3, Target, CircleDot, FileText, Eye, ChevronRight, ChevronDown, User, Cpu, Trophy, Activity, Brain, Calculator, RefreshCw, TrendingUp, Users } from 'lucide-react';
-import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip as RechartsTooltip, ResponsiveContainer, BarChart, Bar, ReferenceLine } from 'recharts';
-
-// --- 常數與定義 ---
-
-const STRATEGIES = {
-  always_point: { name: '保守型 (只做 Pointing)', desc: '無論局勢如何，總是執行 Pointing。' },
-  always_shoot: { name: '攻擊型 (優先 Shooting)', desc: '只要對手場上有球，就嘗試射擊。' },
-  conditional_shoot: { name: '規則型 (條件判斷)', desc: '依據對手球的距離與自身失誤次數判斷。' },
-  smart_ev_ai: { name: '智能 EV 模型 (AI)', desc: '透過蒙地卡羅模擬計算期望值，選擇最優解 (強化學習行為模擬)。' },
-};
-
-// --- 工具函數 ---
-
-const randomNormal = (mean, stdDev) => {
-  const u = 1 - Math.random();
-  const v = Math.random();
-  const z = Math.sqrt(-2.0 * Math.log(u)) * Math.cos(2.0 * Math.PI * v);
-  return z * stdDev + mean;
-};
-
-const generateDistributionData = (mean, stdDev) => {
-  const data = [];
-  for (let x = 0; x <= 150; x += 5) {
-    const y = (1 / (stdDev * Math.sqrt(2 * Math.PI))) * Math.exp(-0.5 * Math.pow((x - mean) / stdDev, 2));
-    data.push({ x, probability: y });
-  }
-  return data;
-};
-
-const getProbabilities = (stats) => {
-  const pMiss = (100 - stats.hitRate) / 100;
-  const pHit = stats.hitRate / 100;
-  const pStay = pHit * (stats.stayRate / 100);
-  const pClear = pHit - pStay;
-  return { 0: pMiss, 1: pClear, 2: pStay };
-};
-
-// 簡單的 ID 產生器
-const generateId = () => Math.random().toString(36).substr(2, 9);
-
-// 標準差計算
-const calculateStats = (values) => {
-    if (values.length === 0) return { mean: 0, stdDev: 0 };
-    const mean = values.reduce((a, b) => a + b, 0) / values.length;
-    const squareDiffs = values.map(value => Math.pow(value - mean, 2));
-    const avgSquareDiff = squareDiffs.reduce((a, b) => a + b, 0) / values.length;
-    return { mean, stdDev: Math.sqrt(avgSquareDiff) };
-};
-
-// --- 智能 AI 核心邏輯 (Value-Based) ---
-
-const evaluateBoardState = (team, myBalls, oppBalls) => {
-    const myBest = myBalls.length > 0 ? Math.min(...myBalls.map(b => b.distance)) : 9999;
-    const oppBest = oppBalls.length > 0 ? Math.min(...oppBalls.map(b => b.distance)) : 9999;
-    let score = 0;
-    if (myBest < oppBest) {
-        const points = myBalls.filter(b => b.distance < oppBest).length;
-        score = points * 10 + (100 - Math.min(100, myBest)) * 0.05;
-    } else {
-        const points = oppBalls.filter(b => b.distance < myBest).length;
-        score = -(points * 10 + (100 - Math.min(100, oppBest)) * 0.05);
-    }
-    return score;
-};
-
-const simulateActionOutcome = (actionType, team, myBalls, oppBalls, stats, probs) => {
-    let newMy = [...myBalls];
-    let newOpp = [...oppBalls];
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
     
-    if (actionType === 'point') {
-        let distance = Math.abs(randomNormal(stats.pointMean, stats.pointStdDev));
-        newMy.push({ distance, team, id: 'sim' });
-    } else {
-        const rand = Math.random();
-        if (newOpp.length > 0) {
-            let sortedOpp = [...newOpp].sort((a, b) => a.distance - b.distance);
-            const target = sortedOpp[0];
-            if (rand < probs[0]) {
-                // Miss
-            } else if (rand < probs[0] + probs[1]) {
-                // Clear
-                sortedOpp.shift(); newOpp = sortedOpp;
-            } else {
-                // Stay
-                sortedOpp.shift();
-                const newDist = Math.abs(target.distance + (Math.random() * 60 - 30));
-                newMy.push({ distance: newDist, team, id: 'sim' });
-                newOpp = sortedOpp;
-            }
-        } else {
-            let distance = Math.abs(randomNormal(stats.pointMean, stats.pointStdDev));
-            newMy.push({ distance, team, id: 'sim' });
-        }
-    }
-    return { myBalls: newMy, oppBalls: newOpp };
-};
-
-const calculateSmartMove = (team, myBalls, oppBalls, stats, probs) => {
-    const SIMULATIONS = 30;
-    let totalPointScore = 0;
-    for(let i=0; i<SIMULATIONS; i++) {
-        const res = simulateActionOutcome('point', team, myBalls, oppBalls, stats, probs);
-        totalPointScore += evaluateBoardState(team, res.myBalls, res.oppBalls);
-    }
-    const avgPointEV = totalPointScore / SIMULATIONS;
-
-    let totalShootScore = 0;
-    if (oppBalls.length === 0) totalShootScore = -9999;
-    else {
-        for(let i=0; i<SIMULATIONS; i++) {
-            const res = simulateActionOutcome('shoot', team, myBalls, oppBalls, stats, probs);
-            totalShootScore += evaluateBoardState(team, res.myBalls, res.oppBalls);
-        }
-    }
-    const avgShootEV = oppBalls.length === 0 ? -99 : totalShootScore / SIMULATIONS;
-    const action = avgShootEV > avgPointEV ? 'shoot' : 'point';
+    <!-- SEO 與分享設定 -->
+    <title>楓之谷打寶機率模擬器 | Drop Rate Simulator</title>
+    <meta name="description" content="輸入掉落機率與打怪效率，模擬計算獲得寶物所需的擊殺數與時間。包含蒙地卡羅模擬與機率曲線分析。">
+    <meta property="og:title" content="楓之谷打寶機率模擬器">
+    <meta property="og:description" content="還沒打到寶物嗎？來算算看你是歐洲人還是非洲人。">
+    <meta property="og:image" content="https://cdn-icons-png.flaticon.com/512/2720/2720635.png">
     
-    return {
-        action,
-        pointEV: avgPointEV,
-        shootEV: avgShootEV,
-        reason: `Pointing EV: ${avgPointEV.toFixed(2)} | Shooting EV: ${avgShootEV.toFixed(2)}`
-    };
-};
+    <!-- 網站圖示 (Favicon) - 使用 Emoji -->
+    <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🎲</text></svg>">
 
+    <!-- Tailwind CSS (樣式庫) -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- Chart.js (圖表庫) -->
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Noto+Sans+TC:wght@400;700&display=swap');
+        body {
+            font-family: 'Noto Sans TC', sans-serif;
+        }
+        .glass-panel {
+            background: rgba(255, 255, 255, 0.95);
+            backdrop-filter: blur(10px);
+            border: 1px solid rgba(255, 255, 255, 0.2);
+        }
+    </style>
+</head>
+<body class="bg-slate-100 min-h-screen p-4 md:p-8 text-slate-800">
 
-// --- 視覺化組件 ---
-
-const FieldVisualizer = ({ ballsA, ballsB, title, highlight }) => {
-  const allBalls = [...ballsA, ...ballsB];
-  const maxDist = Math.max(100, ...allBalls.map(b => b.distance)) + 20;
-
-  return (
-    <div className={`p-4 bg-slate-800 rounded-lg shadow-inner overflow-hidden transition-all duration-500 ${highlight ? 'ring-2 ring-yellow-400' : ''}`}>
-      {title && <div className="text-xs text-gray-400 mb-2 text-center uppercase tracking-widest">{title}</div>}
-      <div className="flex justify-between text-xs text-gray-500 mb-1 px-1">
-        <span>JACK (0cm)</span>
-        <span>{Math.round(maxDist)}cm</span>
-      </div>
-      <div className="relative h-24 border-b-2 border-gray-600 mb-2 bg-slate-800/50 overflow-hidden">
-        {/* Jack */}
-        <div className="absolute bottom-0 left-0 w-3 h-3 bg-yellow-400 rounded-full shadow-[0_0_10px_rgba(250,204,21,0.8)] z-10 transform -translate-x-1/2 translate-y-1/2" title="Jack"></div>
+    <div class="max-w-6xl mx-auto space-y-6">
         
-        {/* Team A Balls (Blue) */}
-        {ballsA.map((ball) => (
-          <div 
-            key={ball.id} 
-            className="absolute bottom-0 w-6 h-6 bg-blue-500 rounded-full border-2 border-blue-200 shadow-lg transform -translate-x-1/2 translate-y-1/2 transition-all duration-500 ease-out z-20 group hover:scale-110 hover:z-30 animate-in zoom-in fade-in duration-300" 
-            style={{ left: `${Math.min(100, (ball.distance / maxDist) * 100)}%` }}
-          >
-            <div className="absolute inset-0 rounded-full bg-gradient-to-tr from-blue-700 to-transparent opacity-50"></div>
-            <span className="absolute -top-8 left-1/2 transform -translate-x-1/2 text-[10px] text-white font-mono bg-blue-900/80 px-1.5 py-0.5 rounded opacity-0 group-hover:opacity-100 transition-opacity whitespace-nowrap pointer-events-none shadow-sm z-40">
-               {ball.distance.toFixed(0)}cm
-            </span>
-          </div>
-        ))}
-
-        {/* Team B Balls (Red) */}
-        {ballsB.map((ball) => (
-          <div 
-            key={ball.id} 
-            className="absolute bottom-0 w-6 h-6 bg-red-600 rounded-full border-2 border-red-200 shadow-lg transform -translate-x-1/2 translate-y-1/2 transition-all duration-500 ease-out z-20 group hover:scale-110 hover:z-30 animate-in zoom-in fade-in duration-300" 
-            style={{ left: `${Math.min(100, (ball.distance / maxDist) * 100)}%` }}
-          >
-             <div className="absolute inset-0 rounded-full bg-gradient-to-tr from-red-800 to-transparent opacity-50"></div>
-             <span className="absolute -top-8 left-1/2 transform -translate-x-1/2 text-[10px] text-white font-mono bg-red-900/80 px-1.5 py-0.5 rounded opacity-0 group-hover:opacity-100 transition-opacity whitespace-nowrap pointer-events-none shadow-sm z-40">
-               {ball.distance.toFixed(0)}cm
-            </span>
-          </div>
-        ))}
-      </div>
-    </div>
-  );
-};
-
-// 優化版滑桿：Debounced Slider
-const DebouncedConfigPanel = ({ teamName, stats, setStats, distData, isPvP }) => {
-  const isA = teamName === 'A';
-  const themeColor = isA ? 'text-blue-700' : 'text-red-600';
-  const strokeColor = isA ? '#2563eb' : '#dc2626';
-  
-  const [localStats, setLocalStats] = useState(stats);
-
-  useEffect(() => { setLocalStats(stats); }, [stats]);
-
-  useEffect(() => {
-    const handler = setTimeout(() => { setStats(localStats); }, 800);
-    return () => clearTimeout(handler);
-  }, [localStats, setStats]);
-
-  const updateLocal = (key, value) => { setLocalStats(prev => ({ ...prev, [key]: value })); };
-
-  const probs = getProbabilities(localStats);
-
-  return (
-    <div className="bg-white rounded-xl shadow-sm border border-gray-100 p-5">
-        <h2 className={`text-xl font-bold ${themeColor} mb-4 flex items-center gap-2 border-b pb-2`}>
-          <Target size={20}/> {teamName} 隊 {localStats.strategy === 'smart_ev_ai' && !isPvP && <span className="text-xs bg-purple-100 text-purple-700 px-2 py-1 rounded-full">Smart AI</span>}
-          {isPvP && <span className="text-xs bg-gray-100 text-gray-600 px-2 py-1 rounded-full">玩家控制</span>}
-        </h2>
-        
-        <div className="mb-4">
-          <h3 className="text-xs font-bold text-gray-400 uppercase tracking-wider mb-2">Pointing (佈球)</h3>
-          <div className="h-16 w-full mb-2 bg-gray-50 rounded-lg p-1">
-            <ResponsiveContainer width="100%" height="100%">
-              <LineChart data={distData}>
-                <Line type="monotone" dataKey="probability" stroke={strokeColor} dot={false} strokeWidth={2} animationDuration={500} />
-                <XAxis dataKey="x" hide />
-                <YAxis hide />
-              </LineChart>
-            </ResponsiveContainer>
-          </div>
-          <NumberSlider label="平均距離" value={localStats.pointMean} min={0} max={150} suffix="cm" onChange={(v) => updateLocal('pointMean', v)} />
-          <NumberSlider label="標準差" value={localStats.pointStdDev} min={5} max={60} suffix="cm" onChange={(v) => updateLocal('pointStdDev', v)} />
-        </div>
-
-        <div className="mb-4">
-          <h3 className="text-xs font-bold text-gray-400 uppercase tracking-wider mb-2">Shooting (射擊)</h3>
-          <NumberSlider label="命中率" value={localStats.hitRate} max={100} suffix="%" onChange={(v) => updateLocal('hitRate', v)} />
-          <NumberSlider label="Carreau率" value={localStats.stayRate} max={100} suffix="%" onChange={(v) => updateLocal('stayRate', v)} />
-          <div className="text-xs text-gray-500 flex justify-between px-2 mt-2 bg-slate-50 p-2 rounded border border-gray-100">
-            <span title="完全沒打中">Miss: <span className="font-mono font-bold">{(probs[0]*100).toFixed(0)}%</span></span>
-            <span title="打中且球滾走">Clear: <span className="font-mono font-bold">{(probs[1]*100).toFixed(0)}%</span></span>
-            <span title="打中且球留在原地">Stay: <span className="font-mono font-bold">{(probs[2]*100).toFixed(0)}%</span></span>
-          </div>
-        </div>
-
-        <div className={`p-3 rounded-lg border ${isA ? 'bg-blue-50 border-blue-100' : 'bg-red-50 border-red-100'}`}>
-          <span className={`text-xs font-bold ${isA ? 'text-blue-600' : 'text-red-600'} uppercase block mb-2`}>
-            {isPvP ? "能力設定 (策略由玩家操作)" : (isA ? "A 隊策略" : "B 隊策略 (電腦)")}
-          </span>
-          {/* 如果是 PvP 模式，我們隱藏策略選擇，或者讓其無效化，這裡為了簡單我們仍顯示但標註僅供模擬參考，或直接隱藏自動策略部分 */}
-          {!isPvP && (
-            <>
-                <select className="w-full p-2 text-sm border-gray-300 rounded mb-2 bg-white" value={localStats.strategy} onChange={(e) => updateLocal('strategy', e.target.value)}>
-                    {Object.entries(STRATEGIES).map(([key, val]) => (<option key={key} value={key}>{val.name}</option>))}
-                </select>
-                <p className="text-[10px] text-gray-500 mb-2 leading-tight">{STRATEGIES[localStats.strategy].desc}</p>
-                
-                {localStats.strategy === 'conditional_shoot' && (
-                    <div className="border-t border-gray-200 pt-2 mt-2">
-                    <NumberSlider label="觸發距離" value={localStats.shootThreshold} min={10} max={100} suffix="cm" onChange={(v) => updateLocal('shootThreshold', v)} />
-                    <NumberSlider label="容忍失誤" value={localStats.maxMisses} min={0} max={6} suffix="次" onChange={(v) => updateLocal('maxMisses', v)} />
-                    </div>
-                )}
-            </>
-          )}
-          {isPvP && (
-              <p className="text-xs text-gray-500 italic">在雙人對戰模式中，請直接在下方操作面板進行決策。</p>
-          )}
-        </div>
-      </div>
-  );
-};
-
-const NumberSlider = ({ label, value, onChange, min = 0, max = 100, suffix = '' }) => (
-  <div className="mb-3">
-    <div className="flex justify-between items-center text-sm mb-1">
-      <span className="text-gray-600">{label}</span>
-      <div className="flex items-center gap-1">
-        <input type="number" min={min} max={max} value={value} onChange={(e) => { let val = parseFloat(e.target.value); if (isNaN(val)) val = min; if (val < min) val = min; if (val > max) val = max; onChange(val); }} className="w-16 p-1 text-right text-sm border border-gray-300 rounded focus:ring-2 focus:ring-blue-500 outline-none font-mono text-blue-900" />
-        <span className="text-gray-400 w-4">{suffix}</span>
-      </div>
-    </div>
-    <input type="range" min={min} max={max} value={value} onChange={(e) => onChange(Number(e.target.value))} className="w-full h-2 bg-gray-200 rounded-lg appearance-none cursor-pointer accent-blue-600" />
-  </div>
-);
-
-const AIReasoningPanel = ({ reasoning }) => {
-  if (!reasoning) return null;
-  const { pointEV, shootEV, action } = reasoning;
-  const maxVal = Math.max(Math.abs(pointEV), Math.abs(shootEV), 10);
-  const pointPercent = (pointEV / maxVal) * 100;
-  const shootPercent = (shootEV / maxVal) * 100;
-
-  return (
-    <div className="mt-4 bg-slate-900 rounded-lg p-3 border border-slate-700 shadow-lg animate-in fade-in slide-in-from-bottom-2">
-      <div className="flex items-center gap-2 mb-2 text-xs font-bold text-purple-400 uppercase tracking-widest">
-         <Brain size={14} /> AI 戰術思維分析 (期望值計算)
-      </div>
-      <div className="flex gap-4 items-end h-24 mb-2 border-b border-slate-700 pb-2">
-        <div className="flex-1 flex flex-col items-center justify-end h-full gap-1">
-            <span className="text-xs text-gray-400 font-mono">{pointEV.toFixed(1)}</span>
-            <div className={`w-full rounded-t transition-all duration-500 ${action === 'point' ? 'bg-blue-500 opacity-100' : 'bg-blue-900 opacity-50'}`} style={{ height: `${Math.max(5, Math.abs(pointPercent))}%` }}></div>
-            <span className="text-[10px] text-gray-400">Pointing EV</span>
-        </div>
-        <div className="flex-1 flex flex-col items-center justify-end h-full gap-1">
-            <span className="text-xs text-gray-400 font-mono">{shootEV.toFixed(1)}</span>
-            <div className={`w-full rounded-t transition-all duration-500 ${action === 'shoot' ? 'bg-red-500 opacity-100' : 'bg-red-900 opacity-50'}`} style={{ height: `${Math.max(5, Math.abs(shootPercent))}%` }}></div>
-            <span className="text-[10px] text-gray-400">Shooting EV</span>
-        </div>
-      </div>
-      <div className="text-xs text-gray-300 leading-relaxed">
-         <span className="text-purple-400 font-bold">決策：</span> 
-         AI 判斷 {action === 'point' ? 'Pointing (佈球)' : 'Shooting (射擊)'} 能帶來更高的局面分數期望值 (Δ = {Math.abs(pointEV - shootEV).toFixed(2)})。
-      </div>
-    </div>
-  );
-};
-
-// 即時數據統計面板
-const RealTimeStatsPanel = ({ matchStats }) => {
-    const statsA = {
-        shootRate: matchStats.A.shootAttempts > 0 ? (matchStats.A.shootHits / matchStats.A.shootAttempts * 100).toFixed(1) : 0,
-        point: calculateStats(matchStats.A.pointDistances)
-    };
-    const statsB = {
-        shootRate: matchStats.B.shootAttempts > 0 ? (matchStats.B.shootHits / matchStats.B.shootAttempts * 100).toFixed(1) : 0,
-        point: calculateStats(matchStats.B.pointDistances)
-    };
-
-    return (
-        <div className="grid grid-cols-2 gap-2 bg-white rounded-lg border border-gray-200 p-3 text-xs mt-4 shadow-sm">
-            <div className="col-span-2 text-center font-bold text-gray-500 uppercase tracking-widest mb-1 flex items-center justify-center gap-1">
-                <TrendingUp size={12}/> 本場即時數據驗證
-            </div>
-            
-            {/* Team A */}
-            <div className="border-r border-gray-100 pr-2">
-                <div className="font-bold text-blue-600 mb-1">A 隊表現</div>
-                <div className="flex justify-between mb-1">
-                    <span className="text-gray-500">Shooting</span>
-                    <span className="font-mono">{statsA.shootRate}% ({matchStats.A.shootHits}/{matchStats.A.shootAttempts})</span>
-                </div>
-                <div className="flex justify-between mb-1">
-                    <span className="text-gray-500">Point ({matchStats.A.pointDistances.length}球)</span>
-                    <span className="font-mono">均 {statsA.point.mean.toFixed(1)}</span>
-                </div>
-                <div className="flex justify-between">
-                    <span className="text-gray-500">Point標準差</span>
-                    <span className="font-mono">{statsA.point.stdDev.toFixed(1)}</span>
-                </div>
-            </div>
-
-            {/* Team B */}
-            <div className="pl-2">
-                <div className="font-bold text-red-600 mb-1">B 隊表現</div>
-                <div className="flex justify-between mb-1">
-                    <span className="text-gray-500">Shooting</span>
-                    <span className="font-mono">{statsB.shootRate}% ({matchStats.B.shootHits}/{matchStats.B.shootAttempts})</span>
-                </div>
-                <div className="flex justify-between mb-1">
-                    <span className="text-gray-500">Point ({matchStats.B.pointDistances.length}球)</span>
-                    <span className="font-mono">均 {statsB.point.mean.toFixed(1)}</span>
-                </div>
-                <div className="flex justify-between">
-                    <span className="text-gray-500">Point標準差</span>
-                    <span className="font-mono">{statsB.point.stdDev.toFixed(1)}</span>
-                </div>
-            </div>
-        </div>
-    );
-};
-
-// --- 主要組件 ---
-
-const PetanqueSimulator = () => {
-  const [appMode, setAppMode] = useState('interactive'); // setup, interactive, pvp
-
-  const [teamAStats, setTeamAStats] = useState({
-    pointMean: 50, pointStdDev: 20, hitRate: 60, stayRate: 20,
-    strategy: 'always_point', shootThreshold: 50, maxMisses: 2,
-  });
-
-  const [teamBStats, setTeamBStats] = useState({
-    pointMean: 50, pointStdDev: 20, hitRate: 60, stayRate: 20,
-    strategy: 'smart_ev_ai',
-    shootThreshold: 50, maxMisses: 2,
-  });
-
-  const [simCount, setSimCount] = useState(1000);
-  const [isSimulating, setIsSimulating] = useState(false);
-  const [progress, setProgress] = useState(0);
-  const [results, setResults] = useState(null);
-
-  const [gameState, setGameState] = useState({
-    status: 'idle',
-    score: { A: 0, B: 0 },
-    round: 0,
-    balls: { A: 6, B: 6 },
-    onField: { A: [], B: [] },
-    missesInRound: { A: 0, B: 0 },
-    currentTurn: null,
-    lastWinner: null,
-    logs: [],
-    aiThinking: false,
-    currentAIReasoning: null,
-  });
-
-  const [matchStats, setMatchStats] = useState({
-      A: { pointDistances: [], shootAttempts: 0, shootHits: 0 },
-      B: { pointDistances: [], shootAttempts: 0, shootHits: 0 }
-  });
-
-  const logsEndRef = useRef(null);
-  useEffect(() => { logsEndRef.current?.scrollIntoView({ behavior: "smooth" }); }, [gameState.logs]);
-
-  // --- Core Logic ---
-
-  const executeAction = (actionType, team, currentBalls, opponentBalls, stats, probs) => {
-    let newBalls = [...currentBalls];
-    let newOpponentBalls = [...opponentBalls];
-    let outcomeType = -1; 
-    let logDesc = "";
-
-    if (actionType === 'point') {
-      let distance = Math.abs(randomNormal(stats.pointMean, stats.pointStdDev));
-      newBalls.push({ type: 'point', distance: distance, team: team, id: generateId() });
-      logDesc = `執行 Pointing，落點距離 ${distance.toFixed(1)}cm`;
-    } else {
-      const rand = Math.random();
-      if (newOpponentBalls.length > 0) {
-        newOpponentBalls.sort((a, b) => a.distance - b.distance);
-        const targetBall = newOpponentBalls[0]; 
-        if (rand < probs[0]) {
-          outcomeType = 0; logDesc = `執行 Shooting 失誤 (未擊中)`;
-        } else if (rand < probs[0] + probs[1]) {
-          outcomeType = 1; 
-          newOpponentBalls.shift();
-          logDesc = `執行 Shooting 成功 (擊飛 ${targetBall.distance.toFixed(1)}cm 處的球)`;
-        } else {
-          outcomeType = 2; 
-          const originalDist = targetBall.distance;
-          newOpponentBalls.shift();
-          const displacement = (Math.random() * 200) - 100; 
-          const newDist = Math.abs(originalDist + displacement);
-          newBalls.push({ type: 'shoot_stay', distance: newDist, team: team, id: generateId() });
-          logDesc = `執行 Shooting 完美 (Carreau! 停在 ${newDist.toFixed(1)}cm)`;
-        }
-      } else {
-        let distance = Math.abs(randomNormal(stats.pointMean, stats.pointStdDev));
-        newBalls.push({ type: 'point', distance: distance, team: team, id: generateId() });
-        logDesc = `場上無球被迫改為 Pointing (落點 ${distance.toFixed(1)}cm)`;
-      }
-    }
-    return { myBalls: newBalls, oppBalls: newOpponentBalls, outcome: outcomeType, log: logDesc };
-  };
-
-  const decideActionWrapper = (team, myBalls, oppBalls, stats, probs, missesInRound) => {
-    const strategy = stats.strategy;
-    if (strategy === 'smart_ev_ai') {
-        const decision = calculateSmartMove(team, myBalls, oppBalls, stats, probs);
-        return { action: decision.action, reasoning: decision };
-    }
-    if (oppBalls.length === 0) return { action: 'point', reasoning: null };
-    if (strategy === 'always_point') return { action: 'point', reasoning: null };
-    if (strategy === 'always_shoot') return { action: 'shoot', reasoning: null };
-    if (strategy === 'conditional_shoot') {
-      const bestOpp = Math.min(...oppBalls.map(b => b.distance));
-      if (bestOpp < stats.shootThreshold && missesInRound < stats.maxMisses) {
-        return { action: 'shoot', reasoning: null };
-      }
-      return { action: 'point', reasoning: null };
-    }
-    return { action: 'point', reasoning: null };
-  };
-
-  const getNextThrower = (ballsA, ballsB, onFieldA, onFieldB, lastThrower) => {
-    if (ballsA === 0 && ballsB === 0) return null;
-    if (ballsA === 0) return 'B';
-    if (ballsB === 0) return 'A';
-    const bestA = onFieldA.length > 0 ? Math.min(...onFieldA.map(b => b.distance)) : Infinity;
-    const bestB = onFieldB.length > 0 ? Math.min(...onFieldB.map(b => b.distance)) : Infinity;
-    if (bestA < bestB) return 'B';
-    if (bestB < bestA) return 'A';
-    return lastThrower || 'A';
-  };
-
-  const startInteractiveGame = () => {
-    setGameState({
-      status: 'playing', score: { A: 0, B: 0 }, round: 1,
-      balls: { A: 6, B: 6 }, onField: { A: [], B: [] }, missesInRound: { A: 0, B: 0 },
-      currentTurn: Math.random() < 0.5 ? 'A' : 'B', lastWinner: null,
-      logs: [{ round: 1, text: '比賽開始！第一局由隨機決定先手。' }], aiThinking: false, currentAIReasoning: null
-    });
-    setMatchStats({
-        A: { pointDistances: [], shootAttempts: 0, shootHits: 0 },
-        B: { pointDistances: [], shootAttempts: 0, shootHits: 0 }
-    });
-  };
-
-  const startNextRound = () => {
-    const nextStarter = gameState.score.A > gameState.score.B ? 'A' : (gameState.score.B > gameState.score.A ? 'B' : (gameState.lastWinner || 'A'));
-    setGameState(prev => ({
-      ...prev, status: 'playing', round: prev.round + 1,
-      balls: { A: 6, B: 6 }, onField: { A: [], B: [] }, missesInRound: { A: 0, B: 0 },
-      currentTurn: prev.lastWinner || nextStarter, aiThinking: false, currentAIReasoning: null,
-      logs: [...prev.logs, { round: prev.round + 1, text: `----- 第 ${prev.round + 1} 局開始 -----` }],
-    }));
-  };
-
-  // AI Logic Hook - Only runs in 'interactive' mode
-  useEffect(() => {
-    if (appMode === 'interactive' && gameState.status === 'playing' && gameState.currentTurn === 'B' && !gameState.aiThinking) {
-      setGameState(prev => ({ ...prev, aiThinking: true, currentAIReasoning: null }));
-      setTimeout(() => {
-        const probs = getProbabilities(teamBStats);
-        const decision = decideActionWrapper('B', gameState.onField.B, gameState.onField.A, teamBStats, probs, gameState.missesInRound.B);
-        if (decision.reasoning) {
-             setGameState(prev => ({ ...prev, currentAIReasoning: decision.reasoning }));
-        }
-        handleTurn('B', decision.action, decision.reasoning);
-      }, 1000);
-    }
-  }, [gameState.status, gameState.currentTurn, gameState.aiThinking, appMode]);
-
-  const handleTurn = (team, actionType, reasoning = null) => {
-    const isA = team === 'A';
-    const stats = isA ? teamAStats : teamBStats;
-    const probs = getProbabilities(stats);
-    const myField = isA ? gameState.onField.A : gameState.onField.B;
-    const oppField = isA ? gameState.onField.B : gameState.onField.A;
-
-    const res = executeAction(actionType, team, myField, oppField, stats, probs);
-
-    setMatchStats(prev => {
-        const newStats = { ...prev };
-        if (actionType === 'point') {
-            const newBall = res.myBalls[res.myBalls.length - 1];
-            newStats[team].pointDistances = [...newStats[team].pointDistances, newBall.distance];
-        } else {
-            newStats[team].shootAttempts += 1;
-            if (res.outcome !== 0) {
-                newStats[team].shootHits += 1;
-            }
-        }
-        return newStats;
-    });
-
-    setGameState(prev => {
-      const newOnField = { ...prev.onField };
-      if (isA) { newOnField.A = res.myBalls; newOnField.B = res.oppBalls; } 
-      else { newOnField.B = res.myBalls; newOnField.A = res.oppBalls; }
-
-      const newBalls = { ...prev.balls }; newBalls[team] -= 1;
-      const newMisses = { ...prev.missesInRound };
-      if (actionType === 'shoot' && res.outcome === 0) newMisses[team] += 1;
-
-      const logEntry = { team, action: actionType, text: res.log, round: prev.round, reasoning };
-      const nextTurn = getNextThrower(newBalls.A, newBalls.B, newOnField.A, newOnField.B, team);
-
-      let nextStatus = 'playing';
-      let nextScore = { ...prev.score };
-      let roundWinner = null;
-      let roundPoints = 0;
-      let nextLastWinner = prev.lastWinner;
-
-      if (!nextTurn) {
-        nextStatus = 'round_end';
-        const bestA = newOnField.A.length > 0 ? Math.min(...newOnField.A.map(b => b.distance)) : Infinity;
-        const bestB = newOnField.B.length > 0 ? Math.min(...newOnField.B.map(b => b.distance)) : Infinity;
-
-        if (bestA < bestB) {
-            roundWinner = 'A'; nextLastWinner = 'A';
-            const cutoff = bestB;
-            roundPoints = newOnField.A.filter(b => b.distance < cutoff).length;
-            nextScore.A = Math.min(13, nextScore.A + roundPoints);
-        } else {
-            roundWinner = 'B'; nextLastWinner = 'B';
-            const cutoff = bestA;
-            roundPoints = newOnField.B.filter(b => b.distance < cutoff).length;
-            nextScore.B = Math.min(13, nextScore.B + roundPoints);
-        }
-        if (nextScore.A >= 13 || nextScore.B >= 13) nextStatus = 'game_end';
-      }
-
-      const finalLogs = [...prev.logs, logEntry];
-      if (nextStatus === 'round_end' || nextStatus === 'game_end') {
-          finalLogs.push({ text: `局結束！${roundWinner === 'A' ? 'A隊' : 'B隊'} 獲得 ${roundPoints} 分。`, highlight: true });
-          if (nextStatus === 'game_end') {
-              finalLogs.push({ text: `比賽結束！${nextScore.A >= 13 ? 'A隊' : 'B隊'} 獲勝 (比分 ${nextScore.A}:${nextScore.B})`, highlight: true, gameOver: true });
-          }
-      }
-
-      return {
-        ...prev, status: nextStatus, balls: newBalls, onField: newOnField, missesInRound: newMisses,
-        currentTurn: nextTurn, score: nextScore, lastWinner: nextLastWinner, logs: finalLogs, aiThinking: false,
-        currentAIReasoning: reasoning || prev.currentAIReasoning
-      };
-    });
-  };
-
-  const simulateMatch = useCallback((logging = false) => {
-    let scoreA = 0, scoreB = 0, round = 0, matchLogs = [];
-    let lastWinner = Math.random() < 0.5 ? 'A' : 'B';
-    const probsA = getProbabilities(teamAStats);
-    const probsB = getProbabilities(teamBStats);
-
-    while (scoreA < 13 && scoreB < 13) {
-      round++;
-      let roundLog = { roundNum: round, startScoreA: scoreA, startScoreB: scoreB, actions: [], finalState: null };
-      let ballsA = 6, ballsB = 6;
-      let onFieldA = [], onFieldB = [];
-      let missesA = 0, missesB = 0;
-      let currentTurn = lastWinner;
-
-      if (currentTurn === 'A') {
-        const res = executeAction('point', 'A', onFieldA, onFieldB, teamAStats, probsA);
-        onFieldA = res.myBalls; ballsA--;
-        if(logging) roundLog.actions.push({ team: 'A', type: 'point', desc: res.log });
-        currentTurn = 'B';
-      } else {
-        const res = executeAction('point', 'B', onFieldB, onFieldA, teamBStats, probsB);
-        onFieldB = res.myBalls; ballsB--;
-        if(logging) roundLog.actions.push({ team: 'B', type: 'point', desc: res.log });
-        currentTurn = 'A';
-      }
-
-      while (ballsA > 0 || ballsB > 0) {
-        let bestA = onFieldA.length > 0 ? Math.min(...onFieldA.map(b => b.distance)) : Infinity;
-        let bestB = onFieldB.length > 0 ? Math.min(...onFieldB.map(b => b.distance)) : Infinity;
-        let nextThrower = '';
-        if (ballsA === 0) nextThrower = 'B';
-        else if (ballsB === 0) nextThrower = 'A';
-        else { if (bestA < bestB) nextThrower = 'B'; else nextThrower = 'A'; }
-
-        if (nextThrower === 'A') {
-            const dec = decideActionWrapper('A', onFieldA, onFieldB, teamAStats, probsA, missesA);
-            const res = executeAction(dec.action, 'A', onFieldA, onFieldB, teamAStats, probsA);
-            onFieldA = res.myBalls; onFieldB = res.oppBalls; ballsA--;
-            if (dec.action === 'shoot' && res.outcome === 0) missesA++;
-            if(logging) roundLog.actions.push({ team: 'A', type: dec.action, desc: res.log });
-        } else {
-            const dec = decideActionWrapper('B', onFieldB, onFieldA, teamBStats, probsB, missesB);
-            const res = executeAction(dec.action, 'B', onFieldB, onFieldA, teamBStats, probsB);
-            onFieldB = res.myBalls; onFieldA = res.oppBalls; ballsB--;
-            if (dec.action === 'shoot' && res.outcome === 0) missesB++;
-            if(logging) roundLog.actions.push({ team: 'B', type: dec.action, desc: res.log });
-        }
-      }
-      let roundScoreA = 0, roundScoreB = 0;
-      let finalBestA = onFieldA.length > 0 ? Math.min(...onFieldA.map(b => b.distance)) : Infinity;
-      let finalBestB = onFieldB.length > 0 ? Math.min(...onFieldB.map(b => b.distance)) : Infinity;
-      let roundWinner = '';
-      if (finalBestA < finalBestB) {
-        lastWinner = 'A'; roundWinner = 'A';
-        const cutoff = finalBestB; roundScoreA = onFieldA.filter(b => b.distance < cutoff).length;
-      } else {
-        lastWinner = 'B'; roundWinner = 'B';
-        const cutoff = finalBestA; roundScoreB = onFieldB.filter(b => b.distance < cutoff).length;
-      }
-      if (roundScoreA > 0) scoreA = Math.min(13, scoreA + roundScoreA); else scoreB = Math.min(13, scoreB + roundScoreB);
-      if(logging) {
-          roundLog.finalState = { ballsA: onFieldA, ballsB: onFieldB, winner: roundWinner, points: roundScoreA || roundScoreB };
-          roundLog.endScoreA = scoreA; roundLog.endScoreB = scoreB;
-          matchLogs.push(roundLog);
-      }
-    }
-    return { scoreA, scoreB, winner: scoreA === 13 ? 'A' : 'B', logs: matchLogs };
-  }, [teamAStats, teamBStats]);
-
-  const runBatchSimulation = () => {
-    setIsSimulating(true); setResults(null); setProgress(0);
-    setTimeout(() => {
-      const newResults = { totalMatches: simCount, teamAWins: 0, teamBWins: 0, scoreDistribution: Array(27).fill(0).map((_, i) => ({ scoreGap: i - 13, count: 0, label: '' })) };
-      const hasAI = teamAStats.strategy === 'smart_ev_ai' || teamBStats.strategy === 'smart_ev_ai';
-      const batchSize = hasAI ? 10 : 500; 
-      let current = 0;
-      const runBatch = () => {
-        for (let i = 0; i < batchSize && current < simCount; i++) {
-          const match = simulateMatch(false);
-          current++;
-          if (match.winner === 'A') {
-            newResults.teamAWins++;
-            const index = 13 + (13 - match.scoreB); 
-            if (newResults.scoreDistribution[index]) { newResults.scoreDistribution[index].count++; newResults.scoreDistribution[index].label = `A 13:${match.scoreB}`; }
-          } else {
-            newResults.teamBWins++;
-            const index = 13 + (match.scoreA - 13);
-            if (newResults.scoreDistribution[index]) { newResults.scoreDistribution[index].count++; newResults.scoreDistribution[index].label = `B 13:${match.scoreA}`; }
-          }
-        }
-        setProgress(Math.floor((current / simCount) * 100));
-        if (current < simCount) setTimeout(runBatch, 0);
-        else {
-          newResults.scoreDistribution = newResults.scoreDistribution.filter(d => d.label !== '');
-          setResults(newResults); setIsSimulating(false);
-        }
-      };
-      runBatch();
-    }, 50);
-  };
-
-  const distDataA = useMemo(() => generateDistributionData(teamAStats.pointMean, teamAStats.pointStdDev), [teamAStats]);
-  const distDataB = useMemo(() => generateDistributionData(teamBStats.pointMean, teamBStats.pointStdDev), [teamBStats]);
-
-  return (
-    <div className="min-h-screen bg-slate-100 p-4 md:p-6 font-sans text-slate-800">
-      <div className="max-w-7xl mx-auto">
-        <header className="mb-6">
-          <h1 className="text-2xl md:text-3xl font-extrabold text-slate-800 flex items-center gap-3">
-            <CircleDot className="text-blue-600 w-8 h-8" />
-            法式滾球戰術模擬器 <span className="text-sm font-normal text-white bg-gradient-to-r from-purple-500 to-blue-500 px-2 py-1 rounded-md flex items-center gap-1"><Brain size={12}/> AI 實驗室版</span>
-          </h1>
-          <p className="text-slate-500 mt-1 text-sm">
-            選擇「智能 EV 模型」策略，透過蒙地卡羅模擬預測最佳行動，並即時觀察 AI 的決策期望值分析。
-          </p>
+        <!-- Header -->
+        <header class="text-center mb-8">
+            <div class="inline-block p-3 rounded-full bg-blue-100 mb-4 text-4xl">🎲</div>
+            <h1 class="text-3xl md:text-4xl font-bold text-slate-800 mb-2">打寶機率模擬器</h1>
+            <p class="text-slate-600">楓之谷 / MMORPG 掉落率視覺化與時間估算工具</p>
         </header>
 
-        <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-start">
-          <div className="lg:col-span-3 space-y-6"><DebouncedConfigPanel teamName="A" color="blue" stats={teamAStats} setStats={setTeamAStats} distData={distDataA} isPvP={appMode === 'pvp'} /></div>
-          <div className="lg:col-span-3 space-y-6 lg:order-3"><DebouncedConfigPanel teamName="B" color="red" stats={teamBStats} setStats={setTeamBStats} distData={distDataB} isPvP={appMode === 'pvp'} /></div>
+        <div class="grid grid-cols-1 lg:grid-cols-3 gap-6">
+            
+            <!-- Settings Panel -->
+            <div class="lg:col-span-1 space-y-6">
+                <div class="glass-panel bg-white rounded-2xl shadow-lg p-6 sticky top-6">
+                    <h2 class="text-xl font-bold text-slate-800 mb-4 flex items-center border-b pb-2">
+                        <svg class="w-6 h-6 mr-2 text-blue-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z"></path><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"></path></svg>
+                        參數設定
+                    </h2>
+                    
+                    <div class="space-y-5">
+                        <div>
+                            <label class="block text-sm font-bold text-slate-700 mb-1">大寶物掉落機率 (1/N)</label>
+                            <div class="flex items-center group">
+                                <span class="text-slate-400 mr-2 font-mono text-lg">1 /</span>
+                                <input type="number" id="rareRateDenominator" value="1000000" class="flex-1 block w-full rounded-lg border-slate-300 bg-slate-50 shadow-sm focus:border-blue-500 focus:ring-blue-500 border p-2.5 transition" placeholder="例如: 1000000">
+                            </div>
+                            <p class="text-xs text-slate-500 mt-1">預設：百萬分之一 (0.0001%)</p>
+                        </div>
 
-          <div className="lg:col-span-6 lg:order-2 space-y-4">
-            <div className="flex bg-white p-1 rounded-xl shadow-sm border border-gray-200">
-              <button onClick={() => setAppMode('setup')} className={`flex-1 py-2 px-2 rounded-lg text-xs md:text-sm font-bold transition-all flex items-center justify-center gap-1 ${appMode === 'setup' ? 'bg-slate-100 text-slate-800 shadow-inner' : 'text-slate-400 hover:text-slate-600'}`}>
-                <BarChart3 size={16}/> 大數據模擬
-              </button>
-              <button onClick={() => setAppMode('interactive')} className={`flex-1 py-2 px-2 rounded-lg text-xs md:text-sm font-bold transition-all flex items-center justify-center gap-1 ${appMode === 'interactive' ? 'bg-blue-50 text-blue-700 shadow-inner' : 'text-slate-400 hover:text-slate-600'}`}>
-                <User size={16}/> 人機對戰
-              </button>
-              <button onClick={() => setAppMode('pvp')} className={`flex-1 py-2 px-2 rounded-lg text-xs md:text-sm font-bold transition-all flex items-center justify-center gap-1 ${appMode === 'pvp' ? 'bg-purple-50 text-purple-700 shadow-inner' : 'text-slate-400 hover:text-slate-600'}`}>
-                <Users size={16}/> 雙人對戰
-              </button>
-            </div>
+                        <div>
+                            <label class="block text-sm font-bold text-slate-700 mb-1">基礎掉落物機率 (%)</label>
+                            <div class="flex items-center">
+                                <input type="number" id="basicDropRate" value="40" class="flex-1 block w-full rounded-lg border-slate-300 bg-slate-50 shadow-sm focus:border-blue-500 focus:ring-blue-500 border p-2.5" placeholder="例如: 40">
+                                <span class="text-slate-500 ml-3 font-bold">%</span>
+                            </div>
+                        </div>
 
-            {appMode === 'setup' && (
-              <div className="space-y-4 animate-in fade-in duration-300">
-                <div className="bg-white rounded-xl shadow-sm border border-gray-100 p-5">
-                    <div className="flex items-center gap-2">
-                        <select value={simCount} onChange={(e) => setSimCount(Number(e.target.value))} className="flex-1 p-2 border border-gray-300 rounded-md text-sm" disabled={isSimulating}>
-                        <option value="100">100 場</option> <option value="500">500 場</option> <option value="1000">1,000 場</option>
-                        <option value="5000">5,000 場</option> <option value="10000">10,000 場</option>
-                        </select>
-                        <button onClick={runBatchSimulation} disabled={isSimulating} className={`flex-1 py-2 px-4 rounded-lg flex items-center justify-center gap-2 font-bold text-white text-sm transition-all ${isSimulating ? 'bg-gray-400' : 'bg-green-600 hover:bg-green-700'}`}>
-                        {isSimulating ? <RotateCcw size={16} className="animate-spin" /> : <Play size={16} />} {isSimulating ? `${progress}%` : '開始分析'}
+                         <div>
+                            <label class="block text-sm font-bold text-slate-700 mb-1">打寶效率 (掉落物/分鐘)</label>
+                            <div class="flex items-center">
+                                <input type="number" id="dropsPerMinute" value="60" class="flex-1 block w-full rounded-lg border-slate-300 bg-slate-50 shadow-sm focus:border-blue-500 focus:ring-blue-500 border p-2.5" placeholder="例如: 60">
+                                <span class="text-slate-500 ml-3 text-sm whitespace-nowrap">個 / 分</span>
+                            </div>
+                            <p class="text-xs text-slate-500 mt-1">預估你每分鐘能撿幾個</p>
+                        </div>
+
+                        <button onclick="runSimulation()" class="w-full bg-gradient-to-r from-blue-600 to-blue-500 hover:from-blue-700 hover:to-blue-600 text-white font-bold py-3 px-4 rounded-xl shadow-md hover:shadow-lg transform hover:-translate-y-0.5 transition duration-200 flex justify-center items-center mt-4">
+                            <svg class="w-5 h-5 mr-2 animate-pulse" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M14.752 11.168l-3.197-2.132A1 1 0 0010 9.87v4.263a1 1 0 001.555.832l3.197-2.132a1 1 0 000-1.664z"></path><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 12a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg>
+                            開始模擬 (Run)
                         </button>
                     </div>
-                    {teamBStats.strategy === 'smart_ev_ai' && <div className="mt-2 text-[10px] text-purple-600 flex items-center gap-1"><Brain size={10}/> 使用智能 AI 模擬速度較慢，建議場次從少量開始。</div>}
-                </div>
-                {results && (
-                <div className="bg-white rounded-xl shadow-sm border border-gray-100 p-5">
-                    <div className="flex items-center justify-between mb-4">
-                        <div className="text-center w-1/2 border-r border-gray-100"><div className="text-3xl font-extrabold text-blue-600">{((results.teamAWins / results.totalMatches) * 100).toFixed(1)}%</div><div className="text-xs text-gray-500 font-bold">A 隊勝率</div></div>
-                        <div className="text-center w-1/2"><div className="text-3xl font-extrabold text-red-600">{((results.teamBWins / results.totalMatches) * 100).toFixed(1)}%</div><div className="text-xs text-gray-500 font-bold">B 隊勝率</div></div>
-                    </div>
-                    <div className="h-40 w-full">
-                    <ResponsiveContainer width="100%" height="100%">
-                        <BarChart data={results.scoreDistribution} margin={{top:5, right:5, bottom:5, left:-20}}>
-                        <CartesianGrid strokeDasharray="3 3" vertical={false} />
-                        <XAxis dataKey="label" hide />
-                        <YAxis tick={{fontSize: 10}} />
-                        <RechartsTooltip labelFormatter={(l)=>l} formatter={(v)=>[v,'場']} contentStyle={{fontSize:'12px'}} />
-                        <ReferenceLine x="A 13:12" stroke="#ccc" />
-                        <Bar dataKey="count">
-                            {results.scoreDistribution.map((e, i) => (<cell key={`c-${i}`} fill={e.scoreGap > 0 ? '#3b82f6' : '#ef4444'} />))}
-                        </Bar>
-                        </BarChart>
-                    </ResponsiveContainer>
-                    </div>
-                </div>
-                )}
-              </div>
-            )}
 
-            {(appMode === 'interactive' || appMode === 'pvp') && (
-              <div className="space-y-4 animate-in fade-in duration-300">
-                {gameState.status === 'idle' ? (
-                  <div className="bg-white rounded-xl shadow-sm border border-gray-100 p-8 text-center">
-                    <div className="bg-blue-50 w-16 h-16 rounded-full flex items-center justify-center mx-auto mb-4">
-                        {appMode === 'pvp' ? <Users className="text-purple-600" size={32}/> : <User className="text-blue-600" size={32} />}
-                    </div>
-                    <h3 className="text-xl font-bold text-gray-800 mb-2">{appMode === 'pvp' ? '雙人對戰模式' : '人機對戰模式'}</h3>
-                    <p className="text-gray-500 mb-6 text-sm">
-                        {appMode === 'pvp' ? '兩位玩家輪流在同一裝置上進行操作，適合線下對戰。' : '建議將 B 隊策略設定為智能 EV 模型，即可在下方日誌中觀察 AI 每一手的思考過程。'}
-                    </p>
-                    <button onClick={startInteractiveGame} className="bg-blue-600 text-white px-8 py-3 rounded-lg font-bold hover:bg-blue-700 shadow-lg transition-all flex items-center gap-2 mx-auto"><Play size={20}/> 開始比賽</button>
-                  </div>
-                ) : (
-                  <div className="bg-white rounded-xl shadow-sm border border-gray-100 overflow-hidden">
-                    <div className="bg-slate-900 text-white p-4 flex justify-between items-center">
-                      <div className="flex flex-col items-center w-20"><span className="text-xs text-blue-400 font-bold">A 隊</span><span className="text-4xl font-mono font-bold">{gameState.score.A}</span></div>
-                      <div className="flex flex-col items-center">
-                        <div className="text-xs text-gray-400 uppercase tracking-widest mb-1">ROUND {gameState.round}</div>
-                        <div className="text-xs bg-slate-800 px-2 py-1 rounded">
-                            {gameState.status === 'game_end' ? 'GAME OVER' : 
-                             gameState.status === 'round_end' ? '局結束' : 
-                             gameState.currentTurn === 'A' ? 'A 隊回合' : (appMode === 'pvp' ? 'B 隊回合' : '電腦思考中...')}
-                        </div>
-                      </div>
-                      <div className="flex flex-col items-center w-20"><span className="text-xs text-red-400 font-bold">B 隊</span><span className="text-4xl font-mono font-bold">{gameState.score.B}</span></div>
-                    </div>
-
-                    <div className="flex justify-between items-center px-4 py-2 bg-white border-b border-gray-200">
-                        <div className="flex flex-col items-start gap-1">
-                            <span className="text-[10px] font-bold text-gray-400 uppercase">A 隊球數 ({gameState.balls.A})</span>
-                            <div className="flex gap-1">
-                                {[...Array(6)].map((_, i) => (<div key={i} className={`w-3 h-3 rounded-full transition-all ${i < gameState.balls.A ? 'bg-blue-500 shadow-sm scale-100' : 'bg-gray-100 border border-gray-200 scale-90'}`}></div>))}
-                            </div>
-                        </div>
-                        
-                        {/* Restart Button */}
-                        <button onClick={startInteractiveGame} className="text-gray-400 hover:text-blue-600 transition-colors p-1" title="重新開始"><RefreshCw size={16}/></button>
-
-                        <div className="flex flex-col items-end gap-1">
-                             <span className="text-[10px] font-bold text-gray-400 uppercase">B 隊球數 ({gameState.balls.B})</span>
-                             <div className="flex gap-1">
-                                {[...Array(6)].map((_, i) => (<div key={i} className={`w-3 h-3 rounded-full transition-all ${i < gameState.balls.B ? 'bg-red-600 shadow-sm scale-100' : 'bg-gray-100 border border-gray-200 scale-90'}`}></div>))}
-                            </div>
-                        </div>
-                    </div>
-
-                    {/* 介面結構重組：球場 -> 操作 -> 日誌 -> 數據 */}
-                    <div className="p-4 bg-slate-100">
-                        <FieldVisualizer ballsA={gameState.onField.A} ballsB={gameState.onField.B} highlight={gameState.currentTurn === 'A'} />
-                    </div>
-
-                    <div className="p-4 border-t border-gray-100 min-h-[80px] flex items-center justify-center bg-white relative z-10">
-                        {gameState.status === 'playing' && gameState.currentTurn === 'A' && (
-                            <div className="flex gap-3 w-full">
-                                <button onClick={() => handleTurn('A', 'point')} className="flex-1 bg-blue-600 hover:bg-blue-700 text-white py-3 rounded-lg font-bold shadow-md flex flex-col items-center justify-center gap-1"><div className="flex items-center gap-1"><Target size={16}/> Pointing</div></button>
-                                <button onClick={() => handleTurn('A', 'shoot')} className="flex-1 bg-red-600 hover:bg-red-700 text-white py-3 rounded-lg font-bold shadow-md flex flex-col items-center justify-center gap-1"><div className="flex items-center gap-1"><Activity size={16}/> Shooting</div></button>
-                            </div>
-                        )}
-                        {gameState.status === 'playing' && gameState.currentTurn === 'B' && (
-                            appMode === 'pvp' ? (
-                                <div className="flex gap-3 w-full">
-                                    <button onClick={() => handleTurn('B', 'point')} className="flex-1 bg-red-600 hover:bg-red-700 text-white py-3 rounded-lg font-bold shadow-md flex flex-col items-center justify-center gap-1"><div className="flex items-center gap-1"><Target size={16}/> Pointing</div></button>
-                                    <button onClick={() => handleTurn('B', 'shoot')} className="flex-1 bg-orange-600 hover:bg-orange-700 text-white py-3 rounded-lg font-bold shadow-md flex flex-col items-center justify-center gap-1"><div className="flex items-center gap-1"><Activity size={16}/> Shooting</div></button>
+                    <!-- Simulation Stats -->
+                    <div id="statsPanel" class="mt-8 pt-6 border-t border-slate-200 hidden animate-fade-in">
+                        <h3 class="text-lg font-bold text-slate-800 mb-4 flex justify-between items-center">
+                            模擬結果 
+                            <span class="text-xs font-normal bg-slate-100 px-2 py-1 rounded text-slate-500">樣本: 1000人</span>
+                        </h3>
+                        <div class="space-y-3 text-sm">
+                            <div class="p-3 bg-green-50 border border-green-100 rounded-xl hover:shadow-sm transition">
+                                <div class="flex justify-between text-green-800 mb-1">
+                                    <span class="font-bold">🏆 最幸運 (歐皇)</span>
+                                    <span id="statBest" class="font-mono font-bold">--</span>
                                 </div>
-                            ) : (
-                                <div className="text-gray-500 flex items-center gap-2"><Cpu className="animate-pulse" size={20}/> 電腦正在思考策略...</div>
-                            )
-                        )}
-                        {gameState.status === 'round_end' && <button onClick={startNextRound} className="bg-slate-800 text-white px-6 py-2 rounded-lg font-bold hover:bg-black flex items-center gap-2"><ChevronRight/> 下一局</button>}
-                        {gameState.status === 'game_end' && <div className="text-center"><div className="text-xl font-bold mb-2 text-slate-800">{gameState.score.A > gameState.score.B ? '🏆 恭喜獲勝！' : '💀 惜敗！再接再厲'}</div><button onClick={startInteractiveGame} className="text-blue-600 font-bold hover:underline text-sm">再玩一場</button></div>}
-                    </div>
-
-                    {/* 日誌區域 (上移) */}
-                    <div className="bg-slate-50 border-t border-gray-200 h-32 overflow-y-auto p-3 text-sm font-mono">
-                        {gameState.logs.length === 0 && <div className="text-center text-gray-400 mt-4">比賽記錄將顯示於此...</div>}
-                        {gameState.logs.map((log, idx) => (
-                            <div key={idx} className={`mb-1 ${log.highlight ? 'font-bold py-1 border-t border-b border-gray-200 my-2 bg-white' : ''} ${log.gameOver ? 'text-lg text-center text-blue-600 py-4' : ''}`}>
-                                {log.round && !log.action && !log.highlight && <span className="text-gray-400 mr-2">[R{log.round}]</span>}
-                                {log.action && <span className={`font-bold mr-2 ${log.team === 'A' ? 'text-blue-600' : 'text-red-600'}`}>{log.team === 'A' ? 'YOU' : (appMode === 'pvp' ? 'P2' : 'CPU')}:</span>}
-                                <span className="text-slate-700">{log.text}</span>
-                                {log.reasoning && <div className="text-[10px] text-purple-600 ml-10 italic border-l-2 border-purple-200 pl-2 mt-1">↳ AI思考: {log.reasoning.reason}</div>}
-                                {idx === gameState.logs.length - 1 && <div ref={logsEndRef} />}
+                                <div id="timeBest" class="text-right text-xs text-green-600 opacity-80">--</div>
                             </div>
-                        ))}
-                    </div>
-                    
-                    {/* 底部數據分析區域 */}
-                    <div className="grid grid-cols-1 md:grid-cols-2 gap-4 p-4 bg-slate-100 border-t border-gray-200">
-                         {/* 即時戰術數據 */}
-                        <RealTimeStatsPanel matchStats={matchStats} />
-                        
-                        {/* AI 思維分析 (如果有) */}
-                        {gameState.currentAIReasoning && teamBStats.strategy === 'smart_ev_ai' && appMode !== 'pvp' ? (
-                             <div className="mt-4 md:mt-0"><AIReasoningPanel reasoning={gameState.currentAIReasoning} /></div>
-                        ) : (
-                             appMode !== 'pvp' && (
-                                <div className="hidden md:flex items-center justify-center text-gray-400 text-xs p-4 border border-dashed border-gray-300 rounded mt-4 md:mt-0">
-                                    僅在 AI 思考時顯示期望值分析
+                            
+                            <div class="p-3 bg-blue-50 border border-blue-100 rounded-xl hover:shadow-sm transition">
+                                <div class="flex justify-between text-blue-800 mb-1">
+                                    <span class="font-bold">📊 平均值 (期望值)</span>
+                                    <span id="statAvg" class="font-mono font-bold">--</span>
                                 </div>
-                             )
-                        )}
-                    </div>
+                                <div id="timeAvg" class="text-right text-xs text-blue-600 opacity-80">--</div>
+                            </div>
 
-                  </div>
-                )}
-              </div>
-            )}
-          </div>
+                             <div class="p-3 bg-yellow-50 border border-yellow-100 rounded-xl hover:shadow-sm transition">
+                                <div class="flex justify-between text-yellow-800 mb-1">
+                                    <span class="font-bold">⚖️ 中位數 (50%門檻)</span>
+                                    <span id="statMedian" class="font-mono font-bold">--</span>
+                                </div>
+                                <div id="timeMedian" class="text-right text-xs text-yellow-600 opacity-80">--</div>
+                            </div>
+
+                            <div class="p-3 bg-red-50 border border-red-100 rounded-xl hover:shadow-sm transition">
+                                <div class="flex justify-between text-red-800 mb-1">
+                                    <span class="font-bold">💀 最倒霉 (非酋)</span>
+                                    <span id="statWorst" class="font-mono font-bold">--</span>
+                                </div>
+                                <div id="timeWorst" class="text-right text-xs text-red-600 opacity-80">--</div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Charts Panel -->
+            <div class="lg:col-span-2 space-y-6">
+                
+                <!-- Theoretical Curve -->
+                <div class="glass-panel bg-white rounded-2xl shadow-lg p-6">
+                    <h2 class="text-xl font-bold text-slate-800 mb-2 border-b pb-2">📈 獲得機率曲線 (理論值)</h2>
+                    <p class="text-sm text-slate-500 mb-4">隨著你蒐集的掉落物變多，獲得寶物的機率如何提升？</p>
+                    <div class="relative h-72 w-full">
+                        <canvas id="probChart"></canvas>
+                    </div>
+                </div>
+
+                <!-- Simulation Histogram -->
+                <div class="glass-panel bg-white rounded-2xl shadow-lg p-6">
+                    <h2 class="text-xl font-bold text-slate-800 mb-2 border-b pb-2">👥 1000位玩家實測分佈</h2>
+                    <p class="text-sm text-slate-500 mb-4">模擬 1000 次從零開始打寶，看看大家都在第幾個掉落物畢業？</p>
+                    <div class="relative h-72 w-full">
+                        <canvas id="simChart"></canvas>
+                    </div>
+                </div>
+                
+                <div class="text-center text-slate-400 text-xs mt-8">
+                    <p>此模擬器僅供參考，實際遊戲機率以官方設定為準。</p>
+                </div>
+
+            </div>
         </div>
-      </div>
     </div>
-  );
-};
 
-export default PetanqueSimulator;
+    <script>
+        let probChartInstance = null;
+        let simChartInstance = null;
+
+        // Helper to format numbers (e.g., 1,000,000)
+        const fmt = (n) => new Intl.NumberFormat().format(Math.round(n));
+
+        // Helper to format time
+        const fmtTime = (minutes) => {
+            if (!minutes || minutes < 0 || !isFinite(minutes)) return '未知';
+            const days = Math.floor(minutes / 1440);
+            const hours = Math.floor((minutes % 1440) / 60);
+            const mins = Math.floor(minutes % 60);
+            
+            let str = '';
+            if (days > 0) str += `${days}天 `;
+            if (hours > 0) str += `${hours}小時 `;
+            if (days === 0 && hours === 0) str += `${mins}分`;
+            else if (mins > 0 && days === 0) str += `${mins}分`;
+            
+            return str.trim() || '小於1分';
+        };
+
+        function runSimulation() {
+            // 1. Get Inputs
+            const rareDenom = parseFloat(document.getElementById('rareRateDenominator').value);
+            const basicRatePercent = parseFloat(document.getElementById('basicDropRate').value);
+            const dropsPerMin = parseFloat(document.getElementById('dropsPerMinute').value);
+            
+            if(!rareDenom || !basicRatePercent || rareDenom <= 0 || basicRatePercent <= 0) {
+                alert("請輸入有效的機率數值");
+                return;
+            }
+
+            const rareRate = 1 / rareDenom;
+            const basicRate = basicRatePercent / 100;
+
+            // 2. Theoretical Calculations (Curve)
+            const killsFor99 = Math.log(0.01) / Math.log(1 - rareRate);
+            const maxDropsX = killsFor99 * basicRate * 1.2; 
+            const steps = 50;
+            const curveLabels = [];
+            const curveData = [];
+
+            for (let i = 0; i <= steps; i++) {
+                const drops = (maxDropsX / steps) * i;
+                const kills = drops / basicRate;
+                const prob = 1 - Math.pow(1 - rareRate, kills);
+                curveLabels.push(Math.round(drops));
+                curveData.push(prob * 100);
+            }
+
+            // 3. Monte Carlo Simulation (1000 runs)
+            const simCount = 1000;
+            const results = [];
+
+            for (let i = 0; i < simCount; i++) {
+                const u = Math.random();
+                const killsNeeded = Math.ceil(Math.log(1 - u) / Math.log(1 - rareRate));
+                const dropsNeeded = Math.round(killsNeeded * basicRate);
+                results.push(dropsNeeded);
+            }
+
+            results.sort((a, b) => a - b);
+
+            // 4. Calculate Statistics
+            const min = results[0];
+            const max = results[results.length - 1];
+            const median = results[Math.floor(results.length / 2)];
+            const sum = results.reduce((a, b) => a + b, 0);
+            const avg = sum / results.length;
+
+            // Update Stats UI
+            document.getElementById('statsPanel').classList.remove('hidden');
+            
+            // Update Values
+            document.getElementById('statBest').innerText = fmt(min) + " 個";
+            document.getElementById('statAvg').innerText = fmt(avg) + " 個";
+            document.getElementById('statMedian').innerText = fmt(median) + " 個";
+            document.getElementById('statWorst').innerText = fmt(max) + " 個";
+
+            // Update Times
+            const updateTime = (id, val) => {
+                const el = document.getElementById(id);
+                if (dropsPerMin > 0) {
+                    el.innerText = `約 ${fmtTime(val / dropsPerMin)}`;
+                } else {
+                    el.innerText = '';
+                }
+            };
+            
+            updateTime('timeBest', min);
+            updateTime('timeAvg', avg);
+            updateTime('timeMedian', median);
+            updateTime('timeWorst', max);
+
+            // 5. Prepare Histogram Data
+            const binCount = 30;
+            const binSize = (max - min) / binCount;
+            const histLabels = [];
+            const histData = new Array(binCount).fill(0);
+
+            for (let i = 0; i < binCount; i++) {
+                const binStart = min + (i * binSize);
+                const binEnd = min + ((i + 1) * binSize);
+                histLabels.push(`${fmt(binStart / 1000)}k - ${fmt(binEnd / 1000)}k`);
+            }
+
+            results.forEach(val => {
+                let binIndex = Math.floor((val - min) / binSize);
+                if (binIndex >= binCount) binIndex = binCount - 1;
+                histData[binIndex]++;
+            });
+
+            // 6. Render Charts
+            renderProbChart(curveLabels, curveData);
+            renderSimChart(histLabels, histData);
+        }
+
+        function renderProbChart(labels, data) {
+            const ctx = document.getElementById('probChart').getContext('2d');
+            
+            if (probChartInstance) probChartInstance.destroy();
+
+            probChartInstance = new Chart(ctx, {
+                type: 'line',
+                data: {
+                    labels: labels,
+                    datasets: [{
+                        label: '獲得機率 (%)',
+                        data: data,
+                        borderColor: 'rgb(37, 99, 235)',
+                        backgroundColor: 'rgba(37, 99, 235, 0.1)',
+                        borderWidth: 3,
+                        fill: true,
+                        tension: 0.4,
+                        pointRadius: 0,
+                        pointHitRadius: 20
+                    }]
+                },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    interaction: {
+                        intersect: false,
+                        mode: 'index',
+                    },
+                    scales: {
+                        x: {
+                            grid: { display: false },
+                            title: { display: true, text: '蒐集的掉落物總數' },
+                            ticks: {
+                                callback: function(value, index, values) {
+                                    const label = this.getLabelForValue(value);
+                                    if (label > 10000) return (label / 10000).toFixed(1) + '萬';
+                                    return label;
+                                }
+                            }
+                        },
+                        y: {
+                            min: 0,
+                            max: 100,
+                            grid: { color: '#f3f4f6' },
+                            title: { display: true, text: '機率 (%)' }
+                        }
+                    },
+                    plugins: {
+                        tooltip: {
+                            backgroundColor: 'rgba(15, 23, 42, 0.9)',
+                            padding: 12,
+                            titleFont: { size: 14 },
+                            bodyFont: { size: 14 },
+                            callbacks: {
+                                label: function(context) {
+                                    return `機率: ${context.parsed.y.toFixed(2)}%`;
+                                }
+                            }
+                        }
+                    }
+                }
+            });
+        }
+
+        function renderSimChart(labels, data) {
+            const ctx = document.getElementById('simChart').getContext('2d');
+            
+            if (simChartInstance) simChartInstance.destroy();
+
+            simChartInstance = new Chart(ctx, {
+                type: 'bar',
+                data: {
+                    labels: labels,
+                    datasets: [{
+                        label: '玩家人數',
+                        data: data,
+                        backgroundColor: function(context) {
+                            const index = context.dataIndex;
+                            const count = context.dataset.data.length;
+                            // Green (Lucky) -> Yellow -> Red (Unlucky)
+                            const r = Math.min(255, (index / count) * 255 * 2.5);
+                            const g = Math.min(255, 255 - ((index / count) * 255 * 1.2));
+                            return `rgba(${r}, ${g}, 100, 0.8)`;
+                        },
+                        borderRadius: 4
+                    }]
+                },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    plugins: {
+                        legend: { display: false },
+                        tooltip: {
+                            backgroundColor: 'rgba(15, 23, 42, 0.9)',
+                            callbacks: {
+                                title: (items) => `掉落物區間: ${items[0].label}`,
+                                label: (item) => `${item.raw} 位玩家在此區間畢業`
+                            }
+                        }
+                    },
+                    scales: {
+                        x: {
+                            grid: { display: false },
+                            title: { display: true, text: '打到的掉落物數量區間 (k = 千)' },
+                            ticks: {
+                                maxTicksLimit: 8,
+                                font: { size: 11 }
+                            }
+                        },
+                        y: {
+                            grid: { color: '#f3f4f6' },
+                            title: { display: true, text: '人數' },
+                            beginAtZero: true
+                        }
+                    }
+                }
+            });
+        }
+
+        // Run default simulation on load
+        window.onload = runSimulation;
+    </script>
+</body>
+</html>
